@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-E.V. (Eternal Voice) - Core LLM Orchestrator & Language Detector
+E.V. (Eternal Voice) - Core LLM Orchestrator with Groq Support
 File 05: AI Brain - Central intelligence engine for language processing and response generation
 
 Handles:
-- LLM provider abstraction (Ollama, OpenAI, Anthropic, Google, Local ONNX)
+- LLM provider abstraction (Groq, Ollama, OpenAI, Anthropic, Google, Local ONNX)
 - Language detection (English, Gujarati, Hindi, Gujlish, Hinglish)
 - Context window management and token tracking
 - Streaming response generation
@@ -237,11 +237,139 @@ class LLMProvider(ABC):
 
 
 # ============================================================================
-# OLLAMA PROVIDER (Local)
+# GROQ PROVIDER (Cloud - Primary)
+# ============================================================================
+
+class GroqProvider(LLMProvider):
+    """Groq Cloud LLM provider (fast inference)."""
+    
+    def __init__(self, config: Dict[str, Any] = None, api_key: Optional[str] = None,
+                 logger: logging.Logger = None):
+        """Initialize Groq provider."""
+        super().__init__(config, api_key, logger=logger)
+        self.api_key = api_key or self.config.get("api_key", "")
+        self.model_name = self.config.get("model_name", "mixtral-8x7b-32768")
+        self.temperature = self.config.get("temperature", 0.7)
+        self.top_p = self.config.get("top_p", 0.9)
+        self.max_tokens = self.config.get("max_tokens", 2048)
+        self.base_url = "https://api.groq.com/openai/v1"
+    
+    async def generate(self, messages: List[Message], **kwargs) -> LLMResponse:
+        """
+        Generate response using Groq.
+        
+        Args:
+            messages: List of Message objects
+            **kwargs: Additional parameters
+            
+        Returns:
+            LLMResponse object
+        """
+        try:
+            from groq import AsyncGroq
+            
+            start_time = time.time()
+            
+            if not self.api_key:
+                raise ValueError("Groq API key not configured")
+            
+            # Prepare messages for Groq
+            formatted_messages = [msg.to_dict() for msg in messages]
+            
+            # Initialize Groq client
+            client = AsyncGroq(api_key=self.api_key)
+            
+            # Create chat completion
+            response = await client.chat.completions.create(
+                model=self.model_name,
+                messages=formatted_messages,
+                temperature=self.temperature,
+                top_p=self.top_p,
+                max_tokens=self.max_tokens,
+                stream=False
+            )
+            
+            latency_ms = (time.time() - start_time) * 1000
+            
+            return LLMResponse(
+                content=response.choices[0].message.content,
+                model=self.model_name,
+                tokens_used=response.usage.completion_tokens,
+                latency_ms=latency_ms,
+                stop_reason=response.choices[0].finish_reason or "stop"
+            )
+            
+        except ImportError:
+            self.logger.error("Groq library not installed. Install with: pip install groq")
+            raise
+        except Exception as e:
+            self.logger.error(f"Groq generation error: {e}", exc_info=True)
+            raise
+    
+    async def stream(self, messages: List[Message], **kwargs) -> AsyncGenerator[str, None]:
+        """
+        Stream response from Groq.
+        
+        Args:
+            messages: List of Message objects
+            **kwargs: Additional parameters
+            
+        Yields:
+            Response tokens
+        """
+        try:
+            from groq import AsyncGroq
+            
+            if not self.api_key:
+                raise ValueError("Groq API key not configured")
+            
+            formatted_messages = [msg.to_dict() for msg in messages]
+            
+            # Initialize Groq client
+            client = AsyncGroq(api_key=self.api_key)
+            
+            # Create streaming chat completion
+            stream = await client.chat.completions.create(
+                model=self.model_name,
+                messages=formatted_messages,
+                temperature=self.temperature,
+                top_p=self.top_p,
+                max_tokens=self.max_tokens,
+                stream=True
+            )
+            
+            async for chunk in stream:
+                if chunk.choices[0].delta.content:
+                    yield chunk.choices[0].delta.content
+        
+        except ImportError:
+            self.logger.error("Groq library not installed. Install with: pip install groq")
+            raise
+        except Exception as e:
+            self.logger.error(f"Groq streaming error: {e}", exc_info=True)
+            raise
+    
+    async def count_tokens(self, text: str) -> int:
+        """
+        Estimate token count for text.
+        
+        Args:
+            text: Input text
+            
+        Returns:
+            Estimated token count
+        """
+        # Groq models use similar tokenization to OpenAI
+        # Rough approximation: ~4 chars per token
+        return max(1, len(text) // 4)
+
+
+# ============================================================================
+# OLLAMA PROVIDER (Local - Fallback)
 # ============================================================================
 
 class OllamaProvider(LLMProvider):
-    """Local Ollama LLM provider."""
+    """Local Ollama LLM provider (fallback)."""
     
     def __init__(self, config: Dict[str, Any] = None, logger: logging.Logger = None):
         """Initialize Ollama provider."""
@@ -303,6 +431,9 @@ class OllamaProvider(LLMProvider):
                 stop_reason="stop"
             )
             
+        except ImportError:
+            self.logger.error("httpx library not installed. Install with: pip install httpx")
+            raise
         except Exception as e:
             self.logger.error(f"Ollama generation error: {e}", exc_info=True)
             raise
@@ -441,11 +572,11 @@ class ResponseCache:
 class AIBrain:
     """
     Core AI orchestrator engine.
-    Manages LLM providers, language detection, context, and response generation.
+    Manages LLM providers (Groq primary, Ollama fallback), language detection, context, and response generation.
     """
     
     def __init__(self, app_root: Path = None, logger: logging.Logger = None,
-                 config_manager = None):
+                 config_manager = None, groq_api_key: Optional[str] = None):
         """
         Initialize AI Brain.
         
@@ -453,6 +584,7 @@ class AIBrain:
             app_root: Path to application root
             logger: Logger instance
             config_manager: ConfigManager instance (optional)
+            groq_api_key: Groq API key (optional, can be set via environment or config)
         """
         self.app_root = app_root or Path.home() / ".eternal_voice"
         self.logger = logger or logging.getLogger("EV.AIBrain")
@@ -466,6 +598,10 @@ class AIBrain:
         except Exception as e:
             self.logger.warning(f"Failed to load config: {e}, using defaults")
             self.ai_config = self._default_config()
+        
+        # Get Groq API key
+        import os
+        self.groq_api_key = groq_api_key or os.getenv("GROQ_API_KEY", "")
         
         # Initialize components
         self.language_detector = LanguageDetector(self.logger)
@@ -487,8 +623,10 @@ class AIBrain:
     def _default_config(self) -> Dict[str, Any]:
         """Return default configuration dictionary."""
         return {
-            "primary_model": "ollama",
+            "primary_model": "groq",
+            "groq_model": "mixtral-8x7b-32768",
             "ollama_endpoint": "http://localhost:11434",
+            "ollama_model": "mistral",
             "context_window": 4096,
             "temperature": 0.7,
             "top_p": 0.9,
@@ -502,27 +640,46 @@ class AIBrain:
         """Initialize LLM providers based on configuration."""
         try:
             # Get config values
-            endpoint = getattr(self.ai_config, 'ollama_endpoint', "http://localhost:11434")
-            context_window = getattr(self.ai_config, 'context_window', 4096)
             temperature = getattr(self.ai_config, 'temperature', 0.7)
             top_p = getattr(self.ai_config, 'top_p', 0.9)
             max_tokens = getattr(self.ai_config, 'max_tokens', 2048)
             
-            # Initialize primary provider (Ollama)
-            config = {
+            # Initialize Groq provider (primary)
+            if self.groq_api_key:
+                groq_config = {
+                    "api_key": self.groq_api_key,
+                    "model_name": getattr(self.ai_config, 'groq_model', "mixtral-8x7b-32768"),
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "max_tokens": max_tokens,
+                }
+                self.primary_provider = GroqProvider(groq_config, self.groq_api_key, self.logger)
+                self.logger.info("Groq provider initialized (primary).")
+            else:
+                self.logger.warning("Groq API key not found, will use Ollama as primary.")
+            
+            # Initialize Ollama provider (fallback)
+            endpoint = getattr(self.ai_config, 'ollama_endpoint', "http://localhost:11434")
+            ollama_config = {
                 "ollama_endpoint": endpoint,
-                "context_window": context_window,
+                "model_name": getattr(self.ai_config, 'ollama_model', "mistral"),
                 "temperature": temperature,
                 "top_p": top_p,
                 "max_tokens": max_tokens,
-                "model_name": "mistral"
             }
-            self.primary_provider = OllamaProvider(config, self.logger)
-            self.logger.info("Ollama provider initialized.")
+            ollama_provider = OllamaProvider(ollama_config, self.logger)
+            self.fallback_providers.append(ollama_provider)
+            self.logger.info("Ollama provider initialized (fallback).")
+            
+            # If Groq not available, use Ollama as primary
+            if self.primary_provider is None:
+                self.primary_provider = ollama_provider
+                self.fallback_providers.clear()
+                self.logger.info("Using Ollama as primary provider.")
             
         except Exception as e:
             self.logger.error(f"Failed to initialize providers: {e}", exc_info=True)
-            # Continue with fallback provider
+            raise
     
     def set_system_prompt(self, prompt: str) -> None:
         """
@@ -638,7 +795,7 @@ class AIBrain:
             if self.primary_provider is None:
                 raise RuntimeError("No LLM provider available")
             
-            self.logger.info("Generating response from LLM...")
+            self.logger.info(f"Generating response using {self.primary_provider.__class__.__name__}...")
             response = await self.primary_provider.generate(context_messages)
             response.language = detected_lang
             
@@ -721,6 +878,7 @@ class AIBrain:
             "languages_used": list(set(msg.language for msg in self.conversation_history if msg.language)),
             "oldest_message": self.conversation_history[0].timestamp if self.conversation_history else None,
             "newest_message": self.conversation_history[-1].timestamp if self.conversation_history else None,
+            "primary_provider": self.primary_provider.__class__.__name__ if self.primary_provider else "None",
         }
     
     def shutdown(self) -> None:
@@ -739,15 +897,23 @@ class AIBrain:
 
 if __name__ == "__main__":
     import sys
+    import os
     
     logging.basicConfig(level=logging.INFO)
     
     async def main():
+        # Check for Groq API key
+        groq_key = os.getenv("GROQ_API_KEY")
+        if not groq_key:
+            print("⚠️ GROQ_API_KEY environment variable not set")
+            print("Set it with: export GROQ_API_KEY='your-api-key'")
+            print("Get your key from: https://console.groq.com")
+        
         app_root = Path.home() / ".eternal_voice_test"
         app_root.mkdir(exist_ok=True)
         
-        # Initialize AI Brain
-        ai_brain = AIBrain(app_root)
+        # Initialize AI Brain with Groq
+        ai_brain = AIBrain(app_root, groq_api_key=groq_key)
         
         # Test language detection
         print("\n[LANGUAGE DETECTION TESTS]")
@@ -763,14 +929,22 @@ if __name__ == "__main__":
             print(f"Text: {text}")
             print(f"Language: {lang}, Confidence: {conf:.2f}\n")
         
-        # Test response generation (requires Ollama to be running)
+        # Test response generation
         print("\n[RESPONSE GENERATION]")
         try:
+            print("Using provider:", ai_brain.primary_provider.__class__.__name__)
             response = await ai_brain.generate("What is Python?")
-            print(f"Response: {response.content[:100]}...")
+            print(f"Response: {response.content[:200]}...")
             print(f"Tokens: {response.tokens_used}, Latency: {response.latency_ms:.2f}ms")
+            print(f"Provider: {ai_brain.primary_provider.__class__.__name__}")
         except Exception as e:
-            print(f"Generation test skipped (Ollama not available): {e}")
+            print(f"Generation test failed: {e}")
+        
+        # Print history summary
+        print("\n[HISTORY SUMMARY]")
+        summary = ai_brain.get_history_summary()
+        for key, value in summary.items():
+            print(f"{key}: {value}")
         
         # Cleanup
         ai_brain.shutdown()
